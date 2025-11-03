@@ -25,6 +25,9 @@ Additional options:
 - `&poster=url` - show an image while loading the scene content
 - `&ministats` - show the runtime CPU (and on desktop, GPU) performance graphs
 - `&skybox=url` - specify an equirectangular skybox image for the skybox
+- `&skyboxProjection=box|dome` - skybox projection mode (default: 'box')
+- `&skyboxScale=200` - skybox scale (default: 200)
+- `&skyboxCenter=x,y,z` - skybox center offset as comma-separated values (default: 0,0,0)
 
 The web app source files are available as strings for templating when you import the package from npm:
 
@@ -100,6 +103,12 @@ type ExperienceSettings = {
     background: {
         color?: number[]
     },
+    skybox?: {
+        url?: string,
+        projection?: 'box' | 'dome',
+        scale?: number,
+        center?: number[]
+    },
     animTracks: AnimTrack[]
 };
 ```
@@ -114,6 +123,26 @@ type ExperienceSettings = {
     "position": [0,1,-1],
     "target": [0,0,0],
     "startAnim": "orbit"
+  }
+}
+```
+
+### Example settings.json with skybox
+
+```json
+{
+  "background": {"color": [0,0,0,0]},
+  "camera": {
+    "fov": 1.0,
+    "position": [0,1,-1],
+    "target": [0,0,0],
+    "startAnim": "orbit"
+  },
+  "skybox": {
+    "url": "./skybox.jpg",
+    "projection": "dome",
+    "scale": 200,
+    "center": [0, 0.05, 0]
   }
 }
 ```

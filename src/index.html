@@ -17,6 +17,14 @@
             if (url.searchParams.has('noanim')) params.noanim = true;
             if (url.searchParams.has('poster')) params.posterUrl = url.searchParams.get('poster');
             if (url.searchParams.has('skybox')) params.skyboxUrl = url.searchParams.get('skybox');
+            if (url.searchParams.has('skyboxProjection')) params.skyboxProjection = url.searchParams.get('skyboxProjection');
+            if (url.searchParams.has('skyboxScale')) params.skyboxScale = parseFloat(url.searchParams.get('skyboxScale'));
+            if (url.searchParams.has('skyboxCenter')) {
+                const center = url.searchParams.get('skyboxCenter').split(',').map(v => parseFloat(v.trim()));
+                if (center.length === 3 && center.every(v => !isNaN(v))) {
+                    params.skyboxCenter = center;
+                }
+            }
             if (url.searchParams.has('ministats')) params.ministats = true;
 
             const createImage = (url) => {

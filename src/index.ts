@@ -4,10 +4,13 @@ import {
     Asset,
     Color,
     Entity,
+    EnvLighting,
     EventHandler,
     MiniStats,
     Quat,
     ShaderChunks,
+    SKYTYPE_BOX,
+    SKYTYPE_DOME,
     Vec3,
     type TextureHandler,
     type Texture,
@@ -237,9 +240,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
 
     // Initialize skybox
-    if (params.skyboxUrl) {
+    // URL parameters take precedence over settings for backward compatibility
+    const skyboxUrl = params.skyboxUrl || settings.skybox?.url;
+    const skyboxProjection = params.skyboxProjection || settings.skybox?.projection || 'box';
+    const skyboxScale = params.skyboxScale !== undefined ? params.skyboxScale : (settings.skybox?.scale ?? 200);
+    const skyboxCenter = params.skyboxCenter || settings.skybox?.center || [0, 0, 0];
+
+    if (skyboxUrl) {
         const skyAsset = new Asset('skybox', 'texture', {
-            url: params.skyboxUrl
+            url: skyboxUrl
         }, {
             type: 'rgbp',
             mipmaps: false,
@@ -248,7 +257,32 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         skyAsset.on('load', () => {
-            app.scene.envAtlas = skyAsset.resource as Texture;
+            const texture = skyAsset.resource as Texture;
+
+            // Convert equirectangular texture to cubemap for skybox rendering
+            const skyboxCubemap = EnvLighting.generateSkyboxCubemap(texture);
+            app.scene.skybox = skyboxCubemap;
+
+            // Generate proper environment lighting
+            const lighting = EnvLighting.generateLightingSource(texture);
+            const envAtlas = EnvLighting.generateAtlas(lighting);
+            lighting.destroy();
+            app.scene.envAtlas = envAtlas;
+
+            // Configure skybox projection type
+            app.scene.sky.type = skyboxProjection === 'dome' ? SKYTYPE_DOME : SKYTYPE_BOX;
+
+            // Configure skybox scale
+            app.scene.sky.node.setLocalScale(new Vec3(skyboxScale, skyboxScale, skyboxScale));
+
+            // Configure skybox center offset
+            app.scene.sky.center = new Vec3(skyboxCenter[0], skyboxCenter[1], skyboxCenter[2]);
+
+            // Enable depth write for depth-of-field effects
+            app.scene.sky.depthWrite = true;
+
+            // Request a render update
+            app.renderNextFrame = true;
         });
 
         app.assets.add(skyAsset);
