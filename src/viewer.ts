@@ -289,6 +289,12 @@ class Viewer {
             activePose.copy(userStart);
         }
 
+        // initialize camera focus in state for UI display
+        const focusPoint = new Vec3();
+        activePose.getFocus(focusPoint);
+        state.cameraFocus = focusPoint;
+        state.cameraDistance = activePose.distance;
+
         // place all user cameras at the start position
         orbitCamera.attach(activePose, false);
         flyCamera.attach(activePose, false);
@@ -375,6 +381,14 @@ class Viewer {
             // apply to camera
             entity.setPosition(activePose.position);
             entity.setEulerAngles(activePose.angles);
+
+            // update camera focus in state for UI display
+            activePose.getFocus(bvec);
+            if (!state.cameraFocus) {
+                state.cameraFocus = new Vec3();
+            }
+            state.cameraFocus.copy(bvec);
+            state.cameraDistance = activePose.distance;
 
             // update animation timeline
             if (state.cameraMode === 'anim') {

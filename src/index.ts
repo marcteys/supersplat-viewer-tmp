@@ -231,7 +231,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         hasAR: app.xr.isAvailable('immersive-ar'),
         hasVR: app.xr.isAvailable('immersive-vr'),
         isFullscreen: false,
-        uiVisible: true
+        uiVisible: true,
+        cameraFocus: null,          // camera look-at focus point (Vec3)
+        cameraDistance: 0           // camera distance to focus point (zoom level)
     });
 
     // Initialize the load-time poster
@@ -312,6 +314,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         'arMode', 'vrMode',
         'enterFullscreen', 'exitFullscreen',
         'info', 'infoPanel', 'desktopTab', 'touchTab', 'desktopInfoPanel', 'touchInfoPanel',
+        'cameraInfoPanel', 'cameraPosition', 'cameraTarget', 'cameraZoom', 'splatCount',
         'timelineContainer', 'handle', 'time',
         'buttonContainer',
         'play', 'pause',
@@ -455,6 +458,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             // close info panel on cancel
             dom.infoPanel.classList.add('hidden');
             dom.settingsPanel.classList.add('hidden');
+            dom.cameraInfoPanel.classList.add('hidden');
 
             // close fullscreen on cancel
             if (state.isFullscreen) {
@@ -462,6 +466,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         } else if (event === 'interrupt') {
             dom.settingsPanel.classList.add('hidden');
+        } else if (event === 'toggleCameraInfo') {
+            // toggle camera info panel on 'i' key
+            dom.cameraInfoPanel.classList.toggle('hidden');
         }
     });
 
@@ -670,9 +677,43 @@ document.addEventListener('DOMContentLoaded', async () => {
                 case 'r':
                     events.fire('inputEvent', 'reset', event);
                     break;
+                case 'i':
+                    events.fire('inputEvent', 'toggleCameraInfo', event);
+                    break;
                 case ' ':
                     events.fire('inputEvent', 'playPause', event);
                     break;
+            }
+        }
+    });
+
+    // Update camera info panel in real-time
+    app.on('update', () => {
+        // Only update if panel is visible (performance optimization)
+        if (!dom.cameraInfoPanel.classList.contains('hidden')) {
+            // Camera position
+            const pos = camera.getPosition();
+            dom.cameraPosition.textContent = `${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)}`;
+
+            // Camera look-at target (from orbit camera focus point)
+            if (state.cameraFocus) {
+                dom.cameraTarget.textContent = `${state.cameraFocus.x.toFixed(2)}, ${state.cameraFocus.y.toFixed(2)}, ${state.cameraFocus.z.toFixed(2)}`;
+            }
+
+            // Camera zoom (distance from camera to focus point)
+            dom.cameraZoom.textContent = state.cameraDistance.toFixed(2);
+
+            // Splat count (visible splats currently rendered)
+            const gsplatComponent = app.root.findComponent('gsplat');
+            const instance = (gsplatComponent as any)?.instance;
+            if (instance) {
+                const totalCount = instance.resource?.numSplats ?? 0;
+                // Get visible count from material parameter (updated by sorter)
+                const materialCount = instance.material?.getParameter('numSplats')?.data;
+                const visibleCount = materialCount ?? totalCount;
+                dom.splatCount.textContent = visibleCount.toLocaleString();
+            } else {
+                dom.splatCount.textContent = '0';
             }
         }
     });
