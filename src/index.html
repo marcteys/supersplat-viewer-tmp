@@ -7,54 +7,47 @@
         <base href="">
         <link rel="stylesheet" href="./index.css">
         <script type="module">
-            const url = new URL(location.href);
-            const settingsUrl = url.searchParams.has('settings') ? url.searchParams.get('settings') : './settings.json';
-            const contentUrl = url.searchParams.has('content') ? url.searchParams.get('content') : './scene.compressed.ply';
-            const params = {};
-
-            // apply url parameter overrides
-            if (url.searchParams.has('noui')) params.noui = true;
-            if (url.searchParams.has('noanim')) params.noanim = true;
-            if (url.searchParams.has('poster')) params.posterUrl = url.searchParams.get('poster');
-            if (url.searchParams.has('skybox')) params.skyboxUrl = url.searchParams.get('skybox');
-            if (url.searchParams.has('skyboxProjection')) params.skyboxProjection = url.searchParams.get('skyboxProjection');
-            if (url.searchParams.has('skyboxScale')) params.skyboxScale = parseFloat(url.searchParams.get('skyboxScale'));
-            if (url.searchParams.has('skyboxCenter')) {
-                const center = url.searchParams.get('skyboxCenter').split(',').map(v => parseFloat(v.trim()));
-                if (center.length === 3 && center.every(v => !isNaN(v))) {
-                    params.skyboxCenter = center;
-                }
-            }
-            if (url.searchParams.has('ministats')) params.ministats = true;
-
             const createImage = (url) => {
                 const img = new Image();
                 img.src = url;
                 return img;
             };
 
-            window.sse = {
-                poster: params.posterUrl && createImage(params.posterUrl),
-                settings: fetch(settingsUrl).then(response => response.json()),
+            const url = new URL(location.href);
+
+            const posterUrl = url.searchParams.get('poster');
+            const skyboxUrl = url.searchParams.get('skybox');
+            const settingsUrl = url.searchParams.has('settings') ? url.searchParams.get('settings') : './settings.json';
+            const contentUrl = url.searchParams.has('content') ? url.searchParams.get('content') : './scene.compressed.ply';
+
+            const sseConfig = {
+                poster: posterUrl && createImage(posterUrl),
+                skyboxUrl,
+                skyboxProjection: url.searchParams.get('skyboxProjection') || undefined,
+                skyboxScale: url.searchParams.has('skyboxScale') ? parseFloat(url.searchParams.get('skyboxScale')) : undefined,
+                skyboxCenter: url.searchParams.has('skyboxCenter') ? url.searchParams.get('skyboxCenter').split(',').map(Number) : undefined,
                 contentUrl,
                 contents: fetch(contentUrl),
-                params
+                noui: url.searchParams.has('noui'),
+                noanim: url.searchParams.has('noanim'),
+                ministats: url.searchParams.has('ministats'),
+                colorize: url.searchParams.has('colorize'),
+                unified: url.searchParams.has('unified'),
+                aa: url.searchParams.has('aa')
+            };
+
+            window.sse = {
+                config: sseConfig,
+                settings: fetch(settingsUrl).then(response => response.json())
             };
         </script>
-        <script type="module" src="./index.js"></script>
     </head>
     <body>
-
-        <pc-app antialias="false" depth="false" high-resolution="true" stencil="false">
+        <pc-app antialias="false" depth="true" high-resolution="true" stencil="false">
             <pc-scene>
                 <!-- Camera (with XR support) -->
                 <pc-entity name="camera root">
-                    <pc-entity name="camera">
-                        <pc-camera near-clip="0.001" far-clip="5000" horizontal-fov="true" tonemap="none"></pc-camera>
-                    </pc-entity>
-                    <!-- XR controllers will be added here -->
-                    <pc-scripts>
-                    </pc-scripts>
+                    <pc-entity name="camera"></pc-entity>
                 </pc-entity>
                 <!-- Light (for XR controllers) -->
                 <pc-entity name="light" rotation="35 45 0">
@@ -285,16 +278,6 @@
             <!-- Tooltip -->
             <div id="tooltip"></div>
         </div>
-        <script type="module">
-            // Load the poster image if available
-            const poster = window.sse?.poster;
-            if (poster) {
-                const element = document.getElementById('poster');
-                element.style.backgroundImage = `url(${poster.src})`;
-                element.style.display = 'block';
-                element.style.filter = 'blur(40px)';
-            }
-        </script>
 
         <!-- SVG Icons -->
         <svg>
@@ -345,5 +328,34 @@
                 <path d="M16 2.09961C16.4971 2.09961 16.9004 2.50294 16.9004 3V7.09961H21C21.4971 7.09961 21.9004 7.50294 21.9004 8C21.9004 8.49706 21.4971 8.90039 21 8.90039H16C15.5029 8.90039 15.0996 8.49706 15.0996 8V3C15.0996 2.50294 15.5029 2.09961 16 2.09961Z" />
             </symbol>
         </svg>
+
+        <!-- Application Script -->
+        <script type="module">
+            import { main } from './index.js';
+
+            const { config, settings } = window.sse;
+            const { poster } = config;
+
+            // Show the poster image
+            if (poster) {
+                const element = document.getElementById('poster');
+                element.style.setProperty('--poster-url', `url(${poster.src})`);
+                element.style.display = 'block';
+                element.style.filter = 'blur(40px)';
+
+                // hide the canvas
+                document.documentElement.style.setProperty('--canvas-opacity', '0');
+            }
+
+            document.addEventListener('DOMContentLoaded', async () => {
+                const [appElement, cameraElement, settingsJson] = await Promise.all([
+                    document.querySelector('pc-app').ready(),
+                    document.querySelector('pc-entity[name="camera"]').ready(),
+                    settings
+                ]);
+
+                const viewer = await main(appElement.app, cameraElement.entity, settingsJson, config);
+            });
+        </script>
     </body>
 </html>

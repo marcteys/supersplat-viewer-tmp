@@ -1,480 +1,469 @@
 import {
     BoundingBox,
+    CameraFrame,
+    type CameraComponent,
     Color,
-    FlyController,
-    Pose,
+    type Entity,
+    type Layer,
+    RenderTarget,
     Mat4,
-    OrbitController,
-    Vec2,
-    Vec3
+    MiniStats,
+    ShaderChunks,
+    type TextureHandler,
+    PIXELFORMAT_RGBA16F,
+    PIXELFORMAT_RGBA32F,
+    TONEMAP_NONE,
+    TONEMAP_LINEAR,
+    TONEMAP_FILMIC,
+    TONEMAP_HEJL,
+    TONEMAP_ACES,
+    TONEMAP_ACES2,
+    TONEMAP_NEUTRAL,
+    Vec3,
+    GSplatComponent,
+    platform
 } from 'playcanvas';
-import type { AppBase, Entity, EventHandler, GSplatComponent, InputController } from 'playcanvas';
 
-import { AnimController, AnimTrack } from './controllers/anim-controller';
-import { easeOut } from './core/math';
-import { AppController } from './input';
-import { Picker } from './picker';
+import { Annotations } from './annotations';
+import { CameraManager } from './camera-manager';
+import { Camera } from './cameras/camera';
+import { nearlyEquals } from './core/math';
+import { InputController } from './input-controller';
+import type { ExperienceSettings, PostEffectSettings } from './settings';
+import type { Global } from './types';
 
-const vecToAngles = (result: Vec3, vec: Vec3) => {
-    const radToDeg = 180 / Math.PI;
-    result.x = Math.asin(vec.y) * radToDeg;
-    result.y = Math.atan2(-vec.x, -vec.z) * radToDeg;
-    result.z = 0;
+// override global pick to pack depth instead of meshInstance id
+const pickDepthGlsl = /* glsl */ `
+uniform vec4 camera_params;     // 1/far, far, near, isOrtho
+vec4 getPickOutput() {
+    float linearDepth = 1.0 / gl_FragCoord.w;
+    float normalizedDepth = (linearDepth - camera_params.z) / (camera_params.y - camera_params.z);
+    return vec4(gaussianColor.a * normalizedDepth, 0.0, 0.0, gaussianColor.a);
+}
+`;
 
-    return result;
+const gammaChunk = `
+vec3 prepareOutputFromGamma(vec3 gammaColor) {
+    return gammaColor;
+}
+`;
+
+const pickDepthWgsl = /* wgsl */ `
+    uniform camera_params: vec4f;       // 1/far, far, near, isOrtho
+    fn getPickOutput() -> vec4f {
+        let linearDepth = 1.0 / pcPosition.w;
+        let normalizedDepth = (linearDepth - uniform.camera_params.z) / (uniform.camera_params.y - uniform.camera_params.z);
+        return vec4f(gaussianColor.a * normalizedDepth, 0.0, 0.0, gaussianColor.a);
+    }
+`;
+
+const tonemapTable: Record<string, number> = {
+    none: TONEMAP_NONE,
+    linear: TONEMAP_LINEAR,
+    filmic: TONEMAP_FILMIC,
+    hejl: TONEMAP_HEJL,
+    aces: TONEMAP_ACES,
+    aces2: TONEMAP_ACES2,
+    neutral: TONEMAP_NEUTRAL
 };
 
-const pose = new Pose();
-const avec = new Vec3();
-const bvec = new Vec3();
-
-// lerp between two poses
-const lerpPose = (result: Pose, a: Pose, b: Pose, t: number) => {
-    // lerp camera position
-    result.position.lerp(a.position, b.position, t);
-
-    // lerp focus point and subtract from camera position
-    a.getFocus(avec);
-    b.getFocus(bvec);
-    avec.lerp(avec, bvec, t).sub(result.position);
-
-    // calculate distance
-    result.distance = avec.length();
-
-    // set angles
-    vecToAngles(result.angles, avec.mulScalar(1.0 / result.distance));
-};
-
-/**
- * Creates a rotation animation track
- *
- * @param initial - The initial pose of the camera.
- * @param keys - The number of keys in the animation.
- * @param duration - The duration of the animation in seconds.
- * @returns - The animation track object containing position and target keyframes.
- */
-const createRotateTrack = (initial: Pose, keys: number = 12, duration: number = 20): AnimTrack => {
-    const times = new Array(keys).fill(0).map((_, i) => i / keys * duration);
-    const position: number[] = [];
-    const target: number[] = [];
-
-    const initialTarget = new Vec3();
-    initial.getFocus(initialTarget);
-
-    const mat = new Mat4();
-    const vec = new Vec3();
-    const dif = new Vec3(
-        initial.position.x - initialTarget.x,
-        initial.position.y - initialTarget.y,
-        initial.position.z - initialTarget.z
-    );
-
-    for (let i = 0; i < keys; ++i) {
-        mat.setFromEulerAngles(0, -i / keys * 360, 0);
-        mat.transformPoint(dif, vec);
-
-        position.push(initialTarget.x + vec.x);
-        position.push(initialTarget.y + vec.y);
-        position.push(initialTarget.z + vec.z);
-
-        target.push(initialTarget.x);
-        target.push(initialTarget.y);
-        target.push(initialTarget.z);
+const applyPostEffectSettings = (cameraFrame: CameraFrame, settings: PostEffectSettings) => {
+    if (settings.sharpness.enabled) {
+        cameraFrame.rendering.sharpness = settings.sharpness.amount;
+    } else {
+        cameraFrame.rendering.sharpness = 0;
     }
 
-    return {
-        name: 'rotate',
-        duration,
-        frameRate: 1,
-        target: 'camera',
-        loopMode: 'repeat',
-        interpolation: 'spline',
-        smoothness: 1,
-        keyframes: {
-            times,
-            values: {
-                position,
-                target
-            }
-        }
-    };
+    const { bloom } = cameraFrame;
+    if (settings.bloom.enabled) {
+        bloom.intensity = settings.bloom.intensity;
+        bloom.blurLevel = settings.bloom.blurLevel;
+    } else {
+        bloom.intensity = 0;
+    }
+
+    const { grading } = cameraFrame;
+    if (settings.grading.enabled) {
+        grading.enabled = true;
+        grading.brightness = settings.grading.brightness;
+        grading.contrast = settings.grading.contrast;
+        grading.saturation = settings.grading.saturation;
+        grading.tint = new Color().fromArray(settings.grading.tint);
+    } else {
+        grading.enabled = false;
+    }
+
+    const { vignette } = cameraFrame;
+    if (settings.vignette.enabled) {
+        vignette.intensity = settings.vignette.intensity;
+        vignette.inner = settings.vignette.inner;
+        vignette.outer = settings.vignette.outer;
+        vignette.curvature = settings.vignette.curvature;
+    } else {
+        vignette.intensity = 0;
+    }
+
+    const { fringing } = cameraFrame;
+    if (settings.fringing.enabled) {
+        fringing.intensity = settings.fringing.intensity;
+    } else {
+        fringing.intensity = 0;
+    }
 };
 
+const anyPostEffectEnabled = (settings: PostEffectSettings): boolean => {
+    return (settings.sharpness.enabled && settings.sharpness.amount > 0) ||
+        (settings.bloom.enabled && settings.bloom.intensity > 0) ||
+        (settings.grading.enabled) ||
+        (settings.vignette.enabled && settings.vignette.intensity > 0) ||
+        (settings.fringing.enabled && settings.fringing.intensity > 0);
+};
+
+const vec = new Vec3();
+
 class Viewer {
-    app: AppBase;
+    global: Global;
 
-    entity: Entity;
+    cameraFrame: CameraFrame;
 
-    events: EventHandler;
+    inputController: InputController;
 
-    state: any;
+    cameraManager: CameraManager;
 
-    settings: any;
+    annotations: Annotations;
 
-    constructor(app: AppBase, entity: Entity, events: EventHandler, state: any, settings: any, params: any) {
-        const { background, camera } = settings;
+    forceRenderNextFrame = false;
+
+    constructor(global: Global, gsplatLoad: Promise<Entity>, skyboxLoad: Promise<void>) {
+        this.global = global;
+
+        const { app, settings, config, events, state, camera } = global;
         const { graphicsDevice } = app;
 
-        this.app = app;
-        this.entity = entity;
-        this.events = events;
-        this.state = state;
-        this.settings = settings;
+        // enable anonymous CORS for image loading in safari
+        (app.loader.getHandler('texture') as TextureHandler).imgParser.crossOrigin = 'anonymous';
+
+        // render skybox as plain equirect
+        const glsl = ShaderChunks.get(graphicsDevice, 'glsl');
+        glsl.set('skyboxPS', glsl.get('skyboxPS').replace('mapRoughnessUv(uv, mipLevel)', 'uv'));
+        glsl.set('pickPS', pickDepthGlsl);
+
+        const wgsl = ShaderChunks.get(graphicsDevice, 'wgsl');
+        wgsl.set('skyboxPS', wgsl.get('skyboxPS').replace('mapRoughnessUv(uv, uniform.mipLevel)', 'uv'));
+        wgsl.set('pickPS', pickDepthWgsl);
 
         // disable auto render, we'll render only when camera changes
         app.autoRender = false;
 
         // apply camera animation settings
-        entity.camera.clearColor = new Color(background.color);
-        entity.camera.fov = camera.fov;
+        camera.camera.aspectRatio = graphicsDevice.width / graphicsDevice.height;
+
+        // configure the camera
+        this.configureCamera(settings);
+
+        // reconfigure camera when entering/exiting XR
+        app.xr.on('start', () => this.configureCamera(settings));
+        app.xr.on('end', () => this.configureCamera(settings));
 
         // handle horizontal fov on canvas resize
         const updateHorizontalFov = () => {
-            this.entity.camera.horizontalFov = graphicsDevice.width > graphicsDevice.height;
-        };
-        graphicsDevice.on('resizecanvas', () => {
-            updateHorizontalFov();
+            camera.camera.horizontalFov = graphicsDevice.width > graphicsDevice.height;
             app.renderNextFrame = true;
-        });
+        };
+        graphicsDevice.on('resizecanvas', updateHorizontalFov);
         updateHorizontalFov();
 
-        // track camera changes
+        // handle HQ mode changes
+        const updateHqMode = () => {
+            // limit the backbuffer to 4k on desktop and HD on mobile
+            // we use the shorter dimension so ultra-wide (or high) monitors still work correctly.
+            const maxRatio = (platform.mobile ? 1080 : 2160) / Math.min(screen.width, screen.height);
+
+            // half pixel resolution with hq mode disabled
+            graphicsDevice.maxPixelRatio = (state.hqMode ? 1.0 : 0.5) * Math.min(maxRatio, window.devicePixelRatio);
+
+            app.renderNextFrame = true;
+        };
+        events.on('hqMode:changed', updateHqMode);
+        updateHqMode();
+
+        // construct debug ministats
+        if (config.ministats) {
+            const options = MiniStats.getDefaultOptions() as any;
+            options.cpu.enabled = false;
+            options.stats = options.stats.filter((s: any) => s.name !== 'DrawCalls');
+            options.stats.push({
+                name: 'VRAM',
+                stats: ['vram.tex'],
+                decimalPlaces: 1,
+                multiplier: 1 / (1024 * 1024),
+                unitsName: 'MB',
+                watermark: 1024
+            }, {
+                name: 'Splats',
+                stats: ['frame.gsplats'],
+                decimalPlaces: 3,
+                multiplier: 1 / 1000000,
+                unitsName: 'M',
+                watermark: 5
+            });
+
+            // eslint-disable-next-line no-new
+            new MiniStats(app, options);
+        }
+
         const prevProj = new Mat4();
         const prevWorld = new Mat4();
+        const sceneBound = new BoundingBox();
 
+        // track the camera state and trigger a render when it changes
         app.on('framerender', () => {
-            const world = this.entity.getWorldTransform();
-            const proj = this.entity.camera.projectionMatrix;
-            const nearlyEquals = (a: Float32Array<ArrayBufferLike>, b: Float32Array<ArrayBufferLike>, epsilon = 1e-4) => {
-                return !a.some((v, i) => Math.abs(v - b[i]) >= epsilon);
-            };
+            const world = camera.getWorldTransform();
+            const proj = camera.camera.projectionMatrix;
 
-            if (params.ministats) {
-                app.renderNextFrame = true;
-            }
-
-            if (!app.autoRender && !app.renderNextFrame) {
-                if (!nearlyEquals(world.data, prevWorld.data) ||
+            if (!app.renderNextFrame) {
+                if (config.ministats ||
+                    !nearlyEquals(world.data, prevWorld.data) ||
                     !nearlyEquals(proj.data, prevProj.data)) {
                     app.renderNextFrame = true;
                 }
-            }
-
-            if (app.renderNextFrame) {
-                prevWorld.copy(world);
-                prevProj.copy(proj);
             }
 
             // suppress rendering till we're ready
             if (!state.readyToRender) {
                 app.renderNextFrame = false;
             }
+
+            if (this.forceRenderNextFrame) {
+                app.renderNextFrame = true;
+            }
+
+            if (app.renderNextFrame) {
+                prevWorld.copy(world);
+                prevProj.copy(proj);
+            }
         });
 
-        events.on('hqMode:changed', (value) => {
-            graphicsDevice.maxPixelRatio = value ? window.devicePixelRatio : 1;
-            app.renderNextFrame = true;
-        });
-        graphicsDevice.maxPixelRatio = state.hqMode ? window.devicePixelRatio : 1;
-    }
+        const applyCamera = (camera: Camera) => {
+            const cameraEntity = global.camera;
 
-    // initialize the viewer once gsplat asset is finished loading (so we know its bound etc)
-    initialize() {
-        const { app, entity, events, state, settings } = this;
+            cameraEntity.setPosition(camera.position);
+            cameraEntity.setEulerAngles(camera.angles);
+            cameraEntity.camera.fov = camera.fov;
 
-        // get the gsplat
-        const gsplat = app.root.findComponent('gsplat') as GSplatComponent;
+            // fit clipping planes to bounding box
+            const boundRadius = sceneBound.halfExtents.length();
 
-        // calculate scene bounding box
-        const bbox = gsplat?.instance?.meshInstance?.aabb ?? new BoundingBox();
+            // calculate the forward distance between the camera to the bound center
+            vec.sub2(sceneBound.center, camera.position);
+            const dist = vec.dot(cameraEntity.forward);
 
-        // create an anim camera
-        // calculate the orbit camera frame position
-        const framePose = (() => {
-            const sceneSize = bbox.halfExtents.length();
-            const distance = sceneSize / Math.sin(entity.camera.fov / 180 * Math.PI * 0.5);
-            return new Pose().look(
-                new Vec3(2, 1, 2).normalize().mulScalar(distance).add(bbox.center),
-                bbox.center
-            );
-        })();
+            const far = Math.max(dist + boundRadius, 1e-2);
+            const near = Math.max(dist - boundRadius, far / (1024 * 16));
 
-        // calculate the orbit camera reset position
-        const resetPose = (() => {
-            const { position, target } = settings.camera;
-            return new Pose().look(
-                new Vec3(position ?? [2, 1, 2]),
-                new Vec3(target ?? [0, 0, 0])
-            );
-        })();
-
-        // calculate the user camera start position (the pose we'll use if there is no animation)
-        const useReset = settings.camera.position || settings.camera.target || bbox.halfExtents.length() > 100;
-        const userStart = (useReset ? resetPose : framePose).clone();
-
-        // if camera doesn't intersect the scene, assume it's an object we're
-        // viewing
-        const isObjectExperience = !bbox.containsPoint(userStart.position);
-
-        // create the cameras
-        const animCamera = ((initial, isObjectExperience) => {
-            const { animTracks, camera } = settings;
-
-            // extract the camera animation track from settings
-            if (animTracks?.length > 0 && camera.startAnim === 'animTrack') {
-                const track = animTracks.find((track: AnimTrack) => track.name === camera.animTrack);
-                if (track) {
-                    return AnimController.fromTrack(track);
-                }
-            } else if (isObjectExperience) {
-                // create basic rotation animation if no anim track is specified
-                return AnimController.fromTrack(createRotateTrack(initial));
-            }
-            return null;
-        })(userStart, isObjectExperience);
-
-        const orbitCamera = (() => {
-            const orbitCamera = new OrbitController();
-
-            orbitCamera.zoomRange = new Vec2(0.01, Infinity);
-            orbitCamera.pitchRange = new Vec2(-90, 90);
-            orbitCamera.rotateDamping = 0.97;
-            orbitCamera.moveDamping = 0.97;
-            orbitCamera.zoomDamping = 0.97;
-
-            return orbitCamera;
-        })();
-
-        const flyCamera = (() => {
-            const flyCamera = new FlyController();
-
-            flyCamera.pitchRange = new Vec2(-90, 90);
-            flyCamera.rotateDamping = 0.97;
-            flyCamera.moveDamping = 0.97;
-
-            return flyCamera;
-        })();
-
-        const getCamera = (cameraMode: 'orbit' | 'anim' | 'fly'): InputController => {
-            switch (cameraMode) {
-                case 'orbit': return orbitCamera;
-                case 'anim': return animCamera;
-                case 'fly': return flyCamera;
-            }
+            cameraEntity.camera.farClip = far;
+            cameraEntity.camera.nearClip = near;
         };
 
-        // set the global animation flag
-        state.hasAnimation = !!animCamera;
-        state.animationDuration = animCamera ? animCamera.cursor.duration : 0;
-        if (animCamera) {
-            state.cameraMode = 'anim';
-        }
-
-        // create controller
-        // set move speed based on scene size, within reason
-        const controller = new AppController(app.graphicsDevice.canvas, entity.camera);
-
-        // fixed move speed
-        controller.moveSpeed = 4;
-
-        // this pose stores the current camera position. it will be blended/smoothed
-        // toward the current active camera
-        const activePose = new Pose();
-
-        if (state.cameraMode === 'anim') {
-            //  first frame of the animation
-            activePose.copy(animCamera.update(controller.frame, 0));
-        } else {
-            // user start position
-            activePose.copy(userStart);
-        }
-
-        // initialize camera focus in state for UI display
-        const focusPoint = new Vec3();
-        activePose.getFocus(focusPoint);
-        state.cameraFocus = focusPoint;
-        state.cameraDistance = activePose.distance;
-
-        // place all user cameras at the start position
-        orbitCamera.attach(activePose, false);
-        flyCamera.attach(activePose, false);
-
-        // the previous camera we're transitioning away from
-        let prevCameraMode = 'orbit';
-
-        // handle input events
-        events.on('inputEvent', (eventName, event) => {
-            const doReset = (pose: Pose) => {
-                switch (state.cameraMode) {
-                    case 'orbit': {
-                        orbitCamera.attach(pose, true);
-                        break;
-                    }
-                    case 'fly': {
-                        if (state.cameraMode !== 'orbit') {
-                            state.cameraMode = 'orbit';
-                        }
-                        orbitCamera.attach(pose, true);
-                        break;
-                    }
-                    case 'anim': {
-                        state.cameraMode = prevCameraMode;
-                        break;
-                    }
-                }
-            };
-
-            switch (eventName) {
-                case 'frame':
-                    doReset(framePose);
-                    break;
-                case 'reset':
-                    doReset(resetPose);
-                    break;
-                case 'cancel':
-                case 'interrupt':
-                    if (state.cameraMode === 'anim') {
-                        state.cameraMode = prevCameraMode;
-                    }
-                    break;
-            }
-        });
-
-        let currCamera = getCamera(state.cameraMode);
-        const prevPose = new Pose();
-
-        // transition time between cameras
-        let transitionTimer = 1;
-
-        // application update
+        // handle application update
         app.on('update', (deltaTime) => {
-
             // in xr mode we leave the camera alone
             if (app.xr.active) {
                 return;
             }
 
-            // update input controller
-            controller.update(deltaTime, state, activePose.distance);
+            if (this.inputController && this.cameraManager) {
+                // update inputs
+                this.inputController.update(deltaTime, this.cameraManager.camera.distance);
 
-            // update touch joystick UI
-            if (state.cameraMode === 'fly') {
-                events.fire('touchJoystickUpdate', controller.joystick.base, controller.joystick.stick);
-            }
+                // update cameras
+                this.cameraManager.update(deltaTime, this.inputController.frame);
 
-            // use dt of 0 if animation is paused
-            const dt = state.cameraMode === 'anim' && state.animationPaused ? 0 : deltaTime;
-
-            // update the camera we're transitioning from
-            transitionTimer = Math.min(1, transitionTimer + deltaTime * 2.0);
-
-            // update camera
-            pose.copy(currCamera.update(controller.frame, dt));
-
-            if (transitionTimer < 1) {
-                // handle lerp away from previous camera
-                lerpPose(activePose, prevPose, pose, easeOut(transitionTimer));
-            } else {
-                activePose.copy(pose);
-            }
-
-            // apply to camera
-            entity.setPosition(activePose.position);
-            entity.setEulerAngles(activePose.angles);
-
-            // update camera focus in state for UI display
-            activePose.getFocus(bvec);
-            if (!state.cameraFocus) {
-                state.cameraFocus = new Vec3();
-            }
-            state.cameraFocus.copy(bvec);
-            state.cameraDistance = activePose.distance;
-
-            // update animation timeline
-            if (state.cameraMode === 'anim') {
-                state.animationTime = animCamera.cursor.value;
+                // apply to the camera entity
+                applyCamera(this.cameraManager.camera);
             }
         });
 
-        // handle camera mode switching
-        events.on('cameraMode:changed', (value, prev) => {
-            prevCameraMode = prev;
-            prevPose.copy(activePose);
-            getCamera(prev).detach();
-
-            currCamera = getCamera(value);
-            switch (value) {
-                case 'orbit':
-                case 'fly':
-                    currCamera.attach(activePose, false);
-                    break;
-            }
-
-            // reset camera transition timer
-            transitionTimer = 0;
+        // unpause the animation on first frame
+        events.on('firstFrame', () => {
+            state.animationPaused = !!config.noanim;
         });
 
-        events.on('setAnimationTime', (time) => {
-            if (animCamera) {
-                animCamera.cursor.value = time;
+        // wait for the model to load
+        Promise.all([gsplatLoad, skyboxLoad]).then((results) => {
+            const gsplat = results[0].gsplat as GSplatComponent;
 
-                // switch to animation camera if we're not already there
-                if (state.cameraMode !== 'anim') {
-                    state.cameraMode = 'anim';
-                }
+            // get scene bounding box
+            const gsplatBbox = gsplat.customAabb;
+            if (gsplatBbox) {
+                sceneBound.setFromTransformedAabb(gsplatBbox, results[0].getWorldTransform());
             }
-        });
 
-        // pick orbit camera focus point on double click
-        let picker: Picker | null = null;
-        events.on('inputEvent', async (eventName, event) => {
-            switch (eventName) {
-                case 'dblclick': {
-                    if (!picker) {
-                        picker = new Picker(app, entity);
+            if (!config.noui) {
+                this.annotations = new Annotations(global, this.cameraFrame != null);
+            }
+
+            this.inputController = new InputController(global);
+
+            this.cameraManager = new CameraManager(global, sceneBound);
+            applyCamera(this.cameraManager.camera);
+
+            const { instance } = gsplat;
+            if (instance) {
+                // kick off gsplat sorting immediately now that camera is in position
+                instance.sort(camera);
+
+                // listen for sorting updates to trigger first frame events
+                instance.sorter?.on('updated', () => {
+                    // request frame render when sorting changes
+                    app.renderNextFrame = true;
+
+                    if (!state.readyToRender) {
+                        // we're ready to render once the first sort has completed
+                        state.readyToRender = true;
+
+                        // wait for the first valid frame to complete rendering
+                        app.once('frameend', () => {
+                            events.fire('firstFrame');
+
+                            // emit first frame event on window
+                            window.firstFrame?.();
+                        });
                     }
-                    const result = await picker.pick(event.offsetX, event.offsetY);
-                    if (result) {
-                        if (state.cameraMode !== 'orbit') {
-                            state.cameraMode = 'orbit';
-                        }
-
-                        // snap distance of focus to picked point to interpolate rotation only
-                        activePose.distance = activePose.position.distance(result);
-                        orbitCamera.attach(activePose, false);
-                        orbitCamera.attach(pose.look(activePose.position, result), true);
-                    }
-                    break;
-                }
-            }
-        });
-
-        // initialize the camera entity to initial position and kick off the
-        // first scene sort (which usually happens during render)
-        entity.setPosition(activePose.position);
-        entity.setEulerAngles(activePose.angles);
-        gsplat?.instance?.sort(entity);
-
-        // handle gsplat sort updates
-        gsplat?.instance?.sorter?.on('updated', () => {
-            // request frame render when sorting changes
-            app.renderNextFrame = true;
-
-            if (!state.readyToRender) {
-                // we're ready to render once the first sort has completed
-                state.readyToRender = true;
-
-                // wait for the first valid frame to complete rendering
-                const frameHandle = app.on('frameend', () => {
-                    frameHandle.off();
-
-                    events.fire('firstFrame');
-
-                    // emit first frame event on window
-                    window.firstFrame?.();
                 });
+            } else {
+
+                const { gsplat } = app.scene;
+
+                // quality ranges
+                const ranges = {
+                    mobile: {
+                        low: {
+                            range: [2, 8],
+                            splatBudget: 1
+                        },
+                        high: {
+                            range: [1, 8],
+                            splatBudget: 2
+                        }
+                    },
+                    desktop: {
+                        low: {
+                            range: [1, 8],
+                            splatBudget: 3
+                        },
+                        high: {
+                            range: [0, 8],
+                            splatBudget: 6
+                        }
+                    }
+                };
+
+                const quality = platform.mobile ? ranges.mobile : ranges.desktop;
+
+                // start in low quality mode so we can get user interacting asap
+                gsplat.lodRangeMin = quality.low.range[0];
+                gsplat.lodRangeMax = quality.low.range[1];
+                results[0].gsplat.splatBudget = quality.low.splatBudget * 1000000;
+
+                // these two allow LOD behind camera to drop, saves lots of splats
+                gsplat.lodUpdateAngle = 90;
+                gsplat.lodBehindPenalty = 5;
+
+                // same performance, but rotating on slow devices does not give us unsorted splats on sides
+                gsplat.radialSorting = true;
+
+                const eventHandler = app.systems.gsplat;
+
+                // we must force continuous rendering with streaming & lod system
+                this.forceRenderNextFrame = true;
+
+                let current = 0;
+                let watermark = 1;
+                const readyHandler = (camera: CameraComponent, layer: Layer, ready: boolean, loading: number) => {
+                    if (ready && loading === 0) {
+                        // scene is done loading
+                        eventHandler.off('frame:ready', readyHandler);
+
+                        state.readyToRender = true;
+
+                        // handle quality mode changes
+                        const updateLod = () => {
+                            const settings = state.hqMode ? quality.high : quality.low;
+                            gsplat.lodRangeMin = settings.range[0];
+                            gsplat.lodRangeMax = settings.range[1];
+                            results[0].gsplat.splatBudget = settings.splatBudget * 1000000;
+                        };
+                        events.on('hqMode:changed', updateLod);
+                        updateLod();
+
+                        // debug colorize lods
+                        gsplat.colorizeLod = config.colorize;
+
+                        // wait for the first valid frame to complete rendering
+                        app.once('frameend', () => {
+                            events.fire('firstFrame');
+
+                            // emit first frame event on window
+                            window.firstFrame?.();
+                        });
+                    }
+
+                    // update loading status
+                    if (loading !== current) {
+                        watermark = Math.max(watermark, loading);
+                        current = watermark - loading;
+                        state.progress = Math.trunc(current / watermark * 100);
+                    }
+                };
+                eventHandler.on('frame:ready', readyHandler);
             }
         });
+    }
+
+    // configure camera based on application mode and post process settings
+    configureCamera(settings: ExperienceSettings) {
+        const { global } = this;
+        const { app, camera } = global;
+        const { postEffectSettings } = settings;
+        const { background } = settings;
+
+        const enableCameraFrame = !app.xr.active && (anyPostEffectEnabled(postEffectSettings) || settings.highPrecisionRendering);
+
+        if (enableCameraFrame) {
+            // create instance
+            if (!this.cameraFrame) {
+                this.cameraFrame = new CameraFrame(app, camera.camera);
+            }
+
+            const { cameraFrame } = this;
+            cameraFrame.enabled = true;
+            cameraFrame.rendering.toneMapping = tonemapTable[settings.tonemapping];
+            cameraFrame.rendering.renderFormats = settings.highPrecisionRendering ? [PIXELFORMAT_RGBA16F, PIXELFORMAT_RGBA32F] : [];
+            applyPostEffectSettings(cameraFrame, postEffectSettings);
+            cameraFrame.update();
+
+            // force gsplat shader to write gamma-space colors
+            ShaderChunks.get(app.graphicsDevice, 'glsl').set('gsplatOutputVS', gammaChunk);
+
+            // ensure the final blit doesn't perform linear->gamma conversion
+            RenderTarget.prototype.isColorBufferSrgb = function () {
+                return true;
+            };
+
+            camera.camera.clearColor = new Color(background.color);
+        } else {
+            // no post effects needed, destroy camera frame if it exists
+            if (this.cameraFrame) {
+                this.cameraFrame.destroy();
+                this.cameraFrame = null;
+            }
+
+            if (!app.xr.active) {
+                camera.camera.toneMapping = tonemapTable[settings.tonemapping];
+                camera.camera.clearColor = new Color(background.color);
+            }
+        }
     }
 }
 
